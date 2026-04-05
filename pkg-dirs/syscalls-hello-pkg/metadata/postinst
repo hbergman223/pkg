@@ -1,0 +1,3 @@
+#!/bin/bash
+
+echo "syscalls-hello installed successfully"

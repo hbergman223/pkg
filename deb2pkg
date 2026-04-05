@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+deb2pkg - Convert Debian .deb packages to .pkg format
+"""
+
+import argparse
+import subprocess
+import shutil
+import re
+from pathlib import Path
+
+def extract_deb_info(deb_file: Path) -> dict:
+    """Extract control information from a .deb file"""
+    result = subprocess.run(
+        ['dpkg-deb', '-f', str(deb_file)],
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        raise Exception(f"Failed to read {deb_file}: {result.stderr}")
+    
+    info = {}
+    for line in result.stdout.split('\n'):
+        if ':' in line:
+            key, value = line.split(':', 1)
+            info[key.strip()] = value.strip()
+    
+    return info
+
+def convert_deb_to_pkg(deb_file: Path, output_dir: Path, pkg_output: Path = None):
+    """Convert a .deb file to .pkg format"""
+    
+    if not deb_file.exists():
+        print(f"Error: {deb_file} does not exist")
+        return False
+    
+    print(f"Converting {deb_file.name}...")
+    
+    # Extract package info
+    try:
+        info = extract_deb_info(deb_file)
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+    
+    package_name = info.get('Package', deb_file.stem.split('_')[0])
+    version = info.get('Version', '1.0.0')
+    maintainer = info.get('Maintainer', 'Unknown')
+    description = info.get('Description', '')
+    depends = info.get('Depends', '')
+    
+    print(f"Package: {package_name}")
+    print(f"Version: {version}")
+    print(f"Maintainer: {maintainer}")
+    
+    # Create package directory structure
+    pkg_dir = output_dir / package_name
+    metadata_dir = pkg_dir / "metadata"
+    data_dir = pkg_dir / "data"
+    
+    # Clean up if exists
+    if pkg_dir.exists():
+        response = input(f"{pkg_dir} exists. Overwrite? [y/N] ")
+        if response.lower() != 'y':
+            print("Aborted")
+            return False
+        shutil.rmtree(pkg_dir)
+    
+    metadata_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    
+    # Extract .deb data
+    print(f"Extracting package data...")
+    result = subprocess.run(
+        ['dpkg-deb', '-x', str(deb_file), str(data_dir)],
+        capture_output=True
+    )
+    
+    if result.returncode != 0:
+        print(f"Error extracting package: {result.stderr.decode()}")
+        return False
+    
+    # Create metadata files
+    print("Creating metadata...")
+    
+    # name
+    (metadata_dir / "name").write_text(package_name + "\n")
+    
+    # version (strip epoch if present)
+    clean_version = version.split(':')[-1]
+    (metadata_dir / "version").write_text(clean_version + "\n")
+    
+    # author
+    (metadata_dir / "author").write_text(maintainer + "\n")
+    
+    # license (extract from copyright file if available)
+    copyright_file = data_dir / "usr/share/doc" / package_name / "copyright"
+    if copyright_file.exists():
+        try:
+            license_text = copyright_file.read_text()
+            # Try to extract just the license name
+            license_match = re.search(r'License:\s*(.+)', license_text)
+            if license_match:
+                license_name = license_match.group(1).strip()
+            else:
+                license_name = "See /usr/share/doc/" + package_name + "/copyright"
+        except:
+            license_name = "Unknown"
+    else:
+        license_name = "Unknown"
+    
+    (metadata_dir / "license").write_text(license_name + "\n")
+    
+    # history
+    (metadata_dir / "history").write_text(f"{clean_version} - Converted from Debian package\n")
+    
+    # depends (convert Debian format to simple format)
+    # Skip system libraries that are assumed to be present
+    system_libs = {
+        'libc6', 'libgcc1', 'libstdc++6', 'zlib1g', 'libpam0g',
+        'libselinux1', 'libtinfo6', 'libncurses6', 'libncursesw6',
+        'base-files', 'debconf', 'dpkg', 'init-system-helpers'
+    }
+    
+    if depends:
+        # Simplify Debian dependencies (remove version constraints for now)
+        simple_depends = []
+        for dep in depends.split(','):
+            dep = dep.strip()
+            # Remove version constraints and alternatives
+            dep = re.split(r'[(<>=|]', dep)[0].strip()
+            # Skip system libraries
+            if dep and dep not in system_libs:
+                simple_depends.append(dep)
+        
+        depends_text = ', '.join(simple_depends)
+        (metadata_dir / "depends").write_text(depends_text + "\n")
+    else:
+        (metadata_dir / "depends").write_text("")
+    
+    # Create a simple postinst script
+    postinst = metadata_dir / "postinst"
+    postinst.write_text(f"""#!/bin/bash
+echo "{package_name} {clean_version} installed successfully"
+""")
+    postinst.chmod(0o755)
+    
+    print(f"Package structure created at {pkg_dir}")
+    
+    # Build .pkg file if requested
+    if pkg_output:
+        print(f"Building {pkg_output}...")
+        result = subprocess.run(
+            ['./pkg', '-b', str(pkg_dir), '-o', str(pkg_output)],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"Error building package: {result.stderr}")
+            return False
+        
+        print(f"Package built: {pkg_output}")
+    
+    # Show summary
+    file_count = sum(1 for _ in data_dir.rglob('*') if _.is_file())
+    print(f"\nSummary:")
+    print(f"  Name: {package_name}")
+    print(f"  Version: {clean_version}")
+    print(f"  Files: {file_count}")
+    print(f"  Directory: {pkg_dir}")
+    if pkg_output:
+        print(f"  Package: {pkg_output}")
+    
+    return True
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert Debian .deb packages to .pkg format"
+    )
+    
+    parser.add_argument('deb_file', type=Path,
+                       help='Input .deb file')
+    parser.add_argument('-d', '--dir', type=Path, default=Path('pkg-dirs'),
+                       help='Output directory for package structure (default: pkg-dirs)')
+    parser.add_argument('-o', '--output', type=Path,
+                       help='Build .pkg file at this path')
+    parser.add_argument('-b', '--build', action='store_true',
+                       help='Build .pkg file automatically (saves to pkgs/)')
+    
+    args = parser.parse_args()
+    
+    # Determine output .pkg path
+    pkg_output = None
+    if args.output:
+        pkg_output = args.output
+    elif args.build:
+        pkgs_dir = Path('pkgs')
+        pkgs_dir.mkdir(exist_ok=True)
+        package_name = args.deb_file.stem.split('_')[0]
+        pkg_output = pkgs_dir / f"{package_name}.pkg"
+    
+    # Convert
+    success = convert_deb_to_pkg(args.deb_file, args.dir, pkg_output)
+    
+    if success and pkg_output:
+        print(f"\nTo install: sudo ./pkg -i {pkg_output}")
+    
+    return 0 if success else 1
+
+if __name__ == "__main__":
+    exit(main())

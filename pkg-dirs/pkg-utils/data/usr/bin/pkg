@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""
+pkg - A dpkg-inspired package manager
+"""
+
+import argparse
+import tarfile
+import json
+import os
+import sys
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Dict, Optional
+
+PKG_DB = Path("/var/lib/pkg/installed")  # Database of installed packages
+PKG_ROOT = Path("/")  # Root for installation
+
+class PackageManager:
+    def __init__(self, db_path: Path = PKG_DB, root: Path = PKG_ROOT):
+        self.db_path = db_path
+        self.root = root
+        self.db_path.mkdir(parents=True, exist_ok=True)
+    
+    def create_package(self, package_dir: Path, output_file: Path):
+        """Create a .pkg file from a directory structure"""
+        if not package_dir.exists():
+            print(f"Error: Package directory {package_dir} does not exist")
+            return False
+        
+        metadata_dir = package_dir / "metadata"
+        data_dir = package_dir / "data"
+        
+        if not metadata_dir.exists() or not data_dir.exists():
+            print("Error: Package must contain 'metadata' and 'data' directories")
+            return False
+        
+        # Validate required metadata files
+        required = ["name", "license", "author", "version"]
+        for req in required:
+            if not (metadata_dir / req).exists():
+                print(f"Error: Missing required metadata file: {req}")
+                return False
+        
+        print(f"Creating package {output_file}...")
+        with tarfile.open(output_file, "w:gz") as tar:
+            # Add without the parent directory name
+            tar.add(metadata_dir, arcname="metadata")
+            tar.add(data_dir, arcname="data")
+        
+        print(f"Package created successfully: {output_file}")
+        return True
+    
+    def extract_package(self, package_file: Path, output_dir: Path):
+        """Extract a .pkg file to a directory"""
+        if not package_file.exists():
+            print(f"Error: Package file {package_file} does not exist")
+            return False
+        
+        print(f"Extracting {package_file} to {output_dir}...")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Try to detect format automatically
+        try:
+            with tarfile.open(package_file, "r:*") as tar:
+                # Use data filter for security (Python 3.12+)
+                if hasattr(tarfile, 'data_filter'):
+                    tar.extractall(output_dir, filter='data')
+                else:
+                    tar.extractall(output_dir)
+        except tarfile.ReadError as e:
+            print(f"Error: Could not read package file: {e}")
+            return False
+        
+        print(f"Package extracted to {output_dir}")
+        return True
+    
+    def read_metadata(self, package_dir: Path) -> Dict[str, str]:
+        """Read metadata from an extracted package"""
+        metadata_dir = package_dir / "metadata"
+        metadata = {}
+        
+        for file in ["name", "license", "author", "version", "history", "depends"]:
+            file_path = metadata_dir / file
+            if file_path.exists():
+                metadata[file] = file_path.read_text().strip()
+        
+        return metadata
+    
+    def run_script(self, script_path: Path, action: str, package_name: str) -> bool:
+        """Run a maintainer script (preinst, postinst, prerm, postrm)"""
+        if not script_path.exists():
+            return True  # Script is optional
+        
+        if not os.access(script_path, os.X_OK):
+            print(f"Warning: {script_path.name} is not executable, skipping")
+            return True
+        
+        print(f"Running {script_path.name} {action}...")
+        try:
+            result = subprocess.run(
+                [str(script_path), action],
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            
+            if result.returncode != 0:
+                print(f"Error: {script_path.name} failed with exit code {result.returncode}")
+                if result.stdout:
+                    print(f"stdout: {result.stdout}")
+                if result.stderr:
+                    print(f"stderr: {result.stderr}")
+                return False
+            
+            # Show script output if any
+            if result.stdout:
+                print(result.stdout, end='')
+            
+            return True
+        except subprocess.TimeoutExpired:
+            print(f"Error: {script_path.name} timed out")
+            return False
+        except Exception as e:
+            print(f"Error running {script_path.name}: {e}")
+            return False
+    
+    def check_dependencies(self, depends: str) -> bool:
+        """Check if all dependencies are installed"""
+        if not depends:
+            return True
+        
+        missing = []
+        for dep in depends.split(','):
+            dep = dep.strip()
+            if not dep:
+                continue
+            
+            # Parse version requirements if present (e.g., "hello >= 1.0.0")
+            parts = dep.split()
+            dep_name = parts[0]
+            
+            pkg_db_entry = self.db_path / dep_name
+            if not pkg_db_entry.exists():
+                missing.append(dep_name)
+            elif len(parts) >= 3:
+                # Version comparison (simplified)
+                op, required_ver = parts[1], parts[2]
+                version_file = pkg_db_entry / "metadata" / "version"
+                if version_file.exists():
+                    installed_ver = version_file.read_text().strip()
+                    if not self.compare_versions(installed_ver, op, required_ver):
+                        missing.append(f"{dep_name} (needs {op} {required_ver}, have {installed_ver})")
+        
+        if missing:
+            print(f"Error: Missing dependencies: {', '.join(missing)}")
+            return False
+        
+        return True
+    
+    def compare_versions(self, v1: str, op: str, v2: str) -> bool:
+        """Compare version strings (simplified implementation)"""
+        # Convert versions to tuples of integers for comparison
+        def parse_version(v):
+            return tuple(int(x) for x in v.split('.') if x.isdigit())
+        
+        try:
+            ver1 = parse_version(v1)
+            ver2 = parse_version(v2)
+            
+            if op == '>=':
+                return ver1 >= ver2
+            elif op == '>':
+                return ver1 > ver2
+            elif op == '<=':
+                return ver1 <= ver2
+            elif op == '<':
+                return ver1 < ver2
+            elif op == '==':
+                return ver1 == ver2
+            else:
+                return True
+        except:
+            return True  # If parsing fails, don't block installation
+    
+    def install_package(self, package_file: Path, force: bool = False):
+        """Install a .pkg file"""
+        if not package_file.exists():
+            print(f"Error: Package file {package_file} does not exist")
+            return False
+        
+        # Extract to temporary directory
+        temp_dir = Path("/tmp/pkg_install")
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+        
+        print(f"Installing package {package_file}...")
+        if not self.extract_package(package_file, temp_dir):
+            return False
+        
+        # Read metadata
+        metadata = self.read_metadata(temp_dir)
+        pkg_name = metadata.get('name')
+        
+        if not pkg_name:
+            print("Error: Package metadata missing 'name' field")
+            shutil.rmtree(temp_dir)
+            return False
+        
+        pkg_version = metadata.get('version', 'unknown')
+        
+        print(f"Package: {pkg_name}")
+        print(f"Version: {pkg_version}")
+        print(f"Author: {metadata.get('author', 'unknown')}")
+        
+        # Check dependencies
+        depends = metadata.get('depends', '')
+        if depends:
+            print(f"Dependencies: {depends}")
+            if not self.check_dependencies(depends):
+                shutil.rmtree(temp_dir)
+                return False
+        
+        # Check if already installed
+        pkg_db_entry = self.db_path / pkg_name
+        if pkg_db_entry.exists() and not force:
+            installed_version = (pkg_db_entry / "metadata" / "version").read_text().strip()
+            print(f"Package {pkg_name} version {installed_version} is already installed")
+            print("Use --force to reinstall")
+            shutil.rmtree(temp_dir)
+            return False
+        
+        # Run preinst script
+        preinst = temp_dir / "metadata" / "preinst"
+        if not self.run_script(preinst, "install", pkg_name):
+            print("Error: preinst script failed")
+            shutil.rmtree(temp_dir)
+            return False
+        
+        # Copy data files to root
+        data_dir = temp_dir / "data"
+        if data_dir.exists():
+            for item in data_dir.rglob("*"):
+                if item.is_file():
+                    rel_path = item.relative_to(data_dir)
+                    dest = self.root / rel_path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    print(f"Installing: {rel_path}")
+                    shutil.copy2(item, dest)
+        
+        # Save metadata to package database
+        pkg_db_entry.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(temp_dir / "metadata", pkg_db_entry / "metadata", dirs_exist_ok=True)
+        
+        # Save file list
+        file_list = pkg_db_entry / "files.list"
+        with open(file_list, "w") as f:
+            for item in data_dir.rglob("*"):
+                if item.is_file():
+                    rel_path = item.relative_to(data_dir)
+                    f.write(f"{rel_path}\n")
+        
+        # Run postinst script
+        postinst = pkg_db_entry / "metadata" / "postinst"
+        if not self.run_script(postinst, "configure", pkg_name):
+            print("Warning: postinst script failed (package installed but may not be configured correctly)")
+        
+        # Cleanup
+        shutil.rmtree(temp_dir)
+        
+        print(f"\nPackage {pkg_name} installed successfully")
+        return True
+    
+    def remove_package(self, package_name: str):
+        """Remove an installed package"""
+        pkg_db_entry = self.db_path / package_name
+        
+        if not pkg_db_entry.exists():
+            print(f"Error: Package {package_name} is not installed")
+            return False
+        
+        print(f"Removing package {package_name}...")
+        
+        # Run prerm script
+        prerm = pkg_db_entry / "metadata" / "prerm"
+        if not self.run_script(prerm, "remove", package_name):
+            print("Error: prerm script failed")
+            return False
+        
+        # Read file list
+        file_list = pkg_db_entry / "files.list"
+        if file_list.exists():
+            with open(file_list) as f:
+                for line in f:
+                    file_path = self.root / line.strip()
+                    if file_path.exists():
+                        print(f"Removing: {line.strip()}")
+                        file_path.unlink()
+        
+        # Run postrm script before removing database entry
+        postrm = pkg_db_entry / "metadata" / "postrm"
+        if not self.run_script(postrm, "remove", package_name):
+            print("Warning: postrm script failed")
+        
+        # Remove package database entry
+        shutil.rmtree(pkg_db_entry)
+        
+        print(f"Package {package_name} removed successfully")
+        return True
+    
+    def list_installed(self):
+        """List all installed packages"""
+        if not self.db_path.exists():
+            print("No packages installed")
+            return
+        
+        packages = [d for d in self.db_path.iterdir() if d.is_dir()]
+        
+        if not packages:
+            print("No packages installed")
+            return
+        
+        print("Installed packages:")
+        print("-" * 60)
+        for pkg in sorted(packages):
+            version_file = pkg / "metadata" / "version"
+            version = version_file.read_text().strip() if version_file.exists() else "unknown"
+            print(f"{pkg.name:30} {version}")
+    
+    def show_info(self, package_name: str):
+        """Show information about an installed package"""
+        pkg_db_entry = self.db_path / package_name
+        
+        if not pkg_db_entry.exists():
+            print(f"Error: Package {package_name} is not installed")
+            return False
+        
+        metadata_dir = pkg_db_entry / "metadata"
+        metadata = {}
+        
+        for file in ["name", "version", "author", "license", "history", "depends"]:
+            file_path = metadata_dir / file
+            if file_path.exists():
+                metadata[file] = file_path.read_text().strip()
+        
+        pkg_name = metadata.get('name', package_name)
+        print(f"Package: {pkg_name}")
+        print(f"Version: {metadata.get('version', 'unknown')}")
+        print(f"Author: {metadata.get('author', 'unknown')}")
+        
+        if 'depends' in metadata:
+            print(f"Dependencies: {metadata['depends']}")
+        
+        print(f"\nLicense:")
+        print(metadata.get('license', 'Not specified'))
+        
+        if 'history' in metadata:
+            print(f"\nHistory:")
+            print(metadata['history'])
+        
+        return True
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pkg - A dpkg-inspired package manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    parser.add_argument('-b', '--build', metavar='DIR', 
+                       help='Build a .pkg file from directory')
+    parser.add_argument('-o', '--output', metavar='FILE',
+                       help='Output file for build operation')
+    parser.add_argument('-x', '--extract', metavar='FILE',
+                       help='Extract a .pkg file')
+    parser.add_argument('-d', '--dest', metavar='DIR',
+                       help='Destination directory for extract')
+    parser.add_argument('-i', '--install', metavar='FILE', nargs='+',
+                       help='Install one or more .pkg files')
+    parser.add_argument('-r', '--remove', metavar='PACKAGE', nargs='+',
+                       help='Remove one or more installed packages')
+    parser.add_argument('-l', '--list', action='store_true',
+                       help='List installed packages')
+    parser.add_argument('-s', '--show', metavar='PACKAGE',
+                       help='Show information about an installed package')
+    parser.add_argument('--force', action='store_true',
+                       help='Force installation even if package exists')
+    parser.add_argument('--db', metavar='PATH',
+                       help=f'Package database path (default: {PKG_DB})')
+    parser.add_argument('--root', metavar='PATH',
+                       help=f'Installation root (default: {PKG_ROOT})')
+    
+    args = parser.parse_args()
+    
+    # Set custom paths if provided
+    db_path = Path(args.db) if args.db else PKG_DB
+    root_path = Path(args.root) if args.root else PKG_ROOT
+    
+    pm = PackageManager(db_path, root_path)
+    
+    # Handle operations
+    if args.build:
+        if not args.output:
+            print("Error: --output required for build operation")
+            sys.exit(1)
+        success = pm.create_package(Path(args.build), Path(args.output))
+        sys.exit(0 if success else 1)
+    
+    elif args.extract:
+        dest = Path(args.dest) if args.dest else Path('.')
+        success = pm.extract_package(Path(args.extract), dest)
+        sys.exit(0 if success else 1)
+    
+    elif args.install:
+        failed = []
+        for pkg_file in args.install:
+            if not pm.install_package(Path(pkg_file), args.force):
+                failed.append(pkg_file)
+        if failed:
+            print(f"\nFailed to install: {', '.join(failed)}")
+            sys.exit(1)
+        sys.exit(0)
+    
+    elif args.remove:
+        failed = []
+        for pkg_name in args.remove:
+            if not pm.remove_package(pkg_name):
+                failed.append(pkg_name)
+        if failed:
+            print(f"\nFailed to remove: {', '.join(failed)}")
+            sys.exit(1)
+        sys.exit(0)
+    
+    elif args.list:
+        pm.list_installed()
+        sys.exit(0)
+    
+    elif args.show:
+        success = pm.show_info(args.show)
+        sys.exit(0 if success else 1)
+    
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
