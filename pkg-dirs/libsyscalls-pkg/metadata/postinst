@@ -1,0 +1,3 @@
+#!/bin/bash
+
+echo "libsyscalls 1.0.0 installed successfully"

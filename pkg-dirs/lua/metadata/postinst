@@ -1,0 +1,2 @@
+#!/bin/bash
+echo "Lua 5.4.8 installed successfully"

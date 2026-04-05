@@ -1,0 +1,5 @@
+1.0 - Released
+1.0.1 - Updated depends and history - Hunter Bergman <hunterbergman125@gmail.com>
+1.0.2 - Rolled back update 1.0.1 and fixed postinst script - Hunter Bergman <hunterbergman125@gmail.com>
+1.1.0 - Added repository support and new commands: pkg-get and pkg-repo-gen - Hunter Bergman <hunterbergman125@gmail.com>
+1.1.1 - Fixed pkg-get to correctly display "pkg-get" instead of "pkg-repo" and updated postinst script - Hunter Bergman <hunterbergman125@gmail.com>

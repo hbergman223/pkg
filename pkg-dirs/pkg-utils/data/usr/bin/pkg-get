@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""
+pkg-repo - Repository client for the pkg package manager
+"""
+
+import argparse
+import json
+import urllib.request
+import urllib.error
+import sys
+import os
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import Dict, List, Optional
+
+REPO_CONFIG = Path.home() / ".config/pkg/repositories.conf"
+CACHE_DIR = Path.home() / ".cache/pkg"
+
+class Repository:
+    def __init__(self, url: str):
+        self.url = url.rstrip('/')
+        self.index = None
+    
+    def fetch_index(self) -> Dict:
+        """Fetch and parse the repository index"""
+        index_url = f"{self.url}/index.json"
+        
+        try:
+            print(f"Fetching repository index from {index_url}...")
+            with urllib.request.urlopen(index_url) as response:
+                data = response.read()
+                self.index = json.loads(data)
+                return self.index
+        except urllib.error.URLError as e:
+            print(f"Error: Could not fetch repository index: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"Error: Invalid repository index format: {e}")
+            return None
+    
+    def search_package(self, query: str) -> List[Dict]:
+        """Search for packages matching query"""
+        if not self.index:
+            if not self.fetch_index():
+                return []
+        
+        results = []
+        query_lower = query.lower()
+        
+        for pkg_name, pkg_info in self.index.get('packages', {}).items():
+            if (query_lower in pkg_name.lower() or 
+                query_lower in pkg_info.get('description', '').lower()):
+                results.append({
+                    'name': pkg_name,
+                    **pkg_info
+                })
+        
+        return results
+    
+    def get_package_info(self, package_name: str) -> Optional[Dict]:
+        """Get information about a specific package"""
+        if not self.index:
+            if not self.fetch_index():
+                return None
+        
+        return self.index.get('packages', {}).get(package_name)
+    
+    def download_package(self, package_name: str, destination: Path) -> bool:
+        """Download a package file"""
+        pkg_info = self.get_package_info(package_name)
+        if not pkg_info:
+            print(f"Error: Package '{package_name}' not found in repository")
+            return False
+        
+        pkg_url = f"{self.url}/{pkg_info['filename']}"
+        
+        try:
+            print(f"Downloading {package_name} {pkg_info['version']}...")
+            
+            # Create progress indicator
+            def reporthook(blocknum, blocksize, totalsize):
+                if totalsize > 0:
+                    percent = min(blocknum * blocksize * 100 / totalsize, 100)
+                    print(f"\rProgress: {percent:.1f}%", end='', flush=True)
+            
+            urllib.request.urlretrieve(pkg_url, destination, reporthook)
+            print()  # New line after progress
+            
+            return True
+        except urllib.error.URLError as e:
+            print(f"\nError: Could not download package: {e}")
+            return False
+
+class RepositoryManager:
+    def __init__(self):
+        self.repos = []
+        self.load_config()
+    
+    def load_config(self):
+        """Load repository configuration"""
+        if REPO_CONFIG.exists():
+            with open(REPO_CONFIG) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        self.repos.append(Repository(line))
+        
+        # Add default if no repos configured
+        if not self.repos:
+            print("No repositories configured. Add one with: pkg-get repo add <URL>", file=sys.stderr)
+    
+    def save_config(self):
+        """Save repository configuration"""
+        REPO_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        with open(REPO_CONFIG, 'w') as f:
+            f.write("# pkg repository configuration\n")
+            f.write("# One repository URL per line\n\n")
+            for repo in self.repos:
+                f.write(f"{repo.url}\n")
+    
+    def add_repository(self, url: str):
+        """Add a new repository"""
+        repo = Repository(url)
+        # Test if repository is accessible
+        if repo.fetch_index():
+            self.repos.append(repo)
+            self.save_config()
+            print(f"Repository added: {url}")
+            return True
+        else:
+            print(f"Error: Could not access repository at {url}")
+            return False
+    
+    def remove_repository(self, url: str):
+        """Remove a repository"""
+        self.repos = [r for r in self.repos if r.url != url]
+        self.save_config()
+        print(f"Repository removed: {url}")
+    
+    def list_repositories(self):
+        """List configured repositories"""
+        if not self.repos:
+            print("No repositories configured")
+            return
+        
+        print("Configured repositories:")
+        for repo in self.repos:
+            print(f"  {repo.url}")
+    
+    def search_all(self, query: str) -> List[Dict]:
+        """Search all repositories"""
+        results = []
+        for repo in self.repos:
+            repo_results = repo.search_package(query)
+            for result in repo_results:
+                result['repository'] = repo.url
+                results.append(result)
+        return results
+    
+    def install_package(self, package_name: str, force: bool = False):
+        """Install a package from repository"""
+        # Search for package in all repos
+        for repo in self.repos:
+            pkg_info = repo.get_package_info(package_name)
+            if pkg_info:
+                # Download to cache
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                pkg_file = CACHE_DIR / pkg_info['filename']
+                
+                if not repo.download_package(package_name, pkg_file):
+                    continue
+                
+                # Install using pkg
+                cmd = ['sudo', 'pkg', '-i', str(pkg_file)]
+                if force:
+                    cmd.append('--force')
+                
+                print(f"Installing {package_name}...")
+                result = subprocess.run(cmd)
+                
+                if result.returncode == 0:
+                    print(f"Successfully installed {package_name}")
+                    return True
+                else:
+                    print(f"Error: Installation failed")
+                    return False
+        
+        print(f"Error: Package '{package_name}' not found in any repository")
+        return False
+
+def cmd_update(args):
+    """Update repository indices"""
+    mgr = RepositoryManager()
+    
+    print("Updating repository indices...")
+    for repo in mgr.repos:
+        if repo.fetch_index():
+            pkg_count = len(repo.index.get('packages', {}))
+            print(f"  {repo.url}: {pkg_count} packages")
+    
+    return 0
+
+def cmd_search(args):
+    """Search for packages"""
+    mgr = RepositoryManager()
+    results = mgr.search_all(args.query)
+    
+    if not results:
+        print(f"No packages found matching '{args.query}'")
+        return 1
+    
+    print(f"Found {len(results)} package(s):\n")
+    
+    for pkg in results:
+        print(f"{pkg['name']} - {pkg['version']}")
+        if 'description' in pkg:
+            print(f"  {pkg['description']}")
+        if 'repository' in pkg:
+            print(f"  Repository: {pkg['repository']}")
+        print()
+    
+    return 0
+
+def cmd_install(args):
+    """Install packages from repository"""
+    mgr = RepositoryManager()
+    
+    failed = []
+    for package in args.packages:
+        if not mgr.install_package(package, args.force):
+            failed.append(package)
+    
+    if failed:
+        print(f"\nFailed to install: {', '.join(failed)}")
+        return 1
+    
+    return 0
+
+def cmd_info(args):
+    """Show package information"""
+    mgr = RepositoryManager()
+    
+    for repo in mgr.repos:
+        pkg_info = repo.get_package_info(args.package)
+        if pkg_info:
+            print(f"Package: {args.package}")
+            print(f"Version: {pkg_info['version']}")
+            print(f"Repository: {repo.url}")
+            
+            if 'description' in pkg_info:
+                print(f"Description: {pkg_info['description']}")
+            if 'author' in pkg_info:
+                print(f"Author: {pkg_info['author']}")
+            if 'license' in pkg_info:
+                print(f"License: {pkg_info['license']}")
+            if 'depends' in pkg_info:
+                print(f"Dependencies: {pkg_info['depends']}")
+            if 'size' in pkg_info:
+                print(f"Size: {pkg_info['size']} bytes")
+            
+            return 0
+    
+    print(f"Error: Package '{args.package}' not found")
+    return 1
+
+def cmd_repo_list(args):
+    """List repositories"""
+    mgr = RepositoryManager()
+    mgr.list_repositories()
+    return 0
+
+def cmd_repo_add(args):
+    """Add repository"""
+    mgr = RepositoryManager()
+    return 0 if mgr.add_repository(args.url) else 1
+
+def cmd_repo_remove(args):
+    """Remove repository"""
+    mgr = RepositoryManager()
+    mgr.remove_repository(args.url)
+    return 0
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="pkg-get - Repository client for pkg package manager"
+    )
+    
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # update command
+    parser_update = subparsers.add_parser('update', help='Update repository indices')
+    parser_update.set_defaults(func=cmd_update)
+    
+    # search command
+    parser_search = subparsers.add_parser('search', help='Search for packages')
+    parser_search.add_argument('query', help='Search query')
+    parser_search.set_defaults(func=cmd_search)
+    
+    # install command
+    parser_install = subparsers.add_parser('install', help='Install packages')
+    parser_install.add_argument('packages', nargs='+', help='Package names to install')
+    parser_install.add_argument('--force', action='store_true', help='Force reinstall')
+    parser_install.set_defaults(func=cmd_install)
+    
+    # info command
+    parser_info = subparsers.add_parser('info', help='Show package information')
+    parser_info.add_argument('package', help='Package name')
+    parser_info.set_defaults(func=cmd_info)
+    
+    # repo commands
+    parser_repo = subparsers.add_parser('repo', help='Manage repositories')
+    repo_subparsers = parser_repo.add_subparsers(dest='repo_command')
+    
+    repo_list = repo_subparsers.add_parser('list', help='List repositories')
+    repo_list.set_defaults(func=cmd_repo_list)
+    
+    repo_add = repo_subparsers.add_parser('add', help='Add repository')
+    repo_add.add_argument('url', help='Repository URL')
+    repo_add.set_defaults(func=cmd_repo_add)
+    
+    repo_remove = repo_subparsers.add_parser('remove', help='Remove repository')
+    repo_remove.add_argument('url', help='Repository URL')
+    repo_remove.set_defaults(func=cmd_repo_remove)
+    
+    args = parser.parse_args()
+    
+    if hasattr(args, 'func'):
+        return args.func(args)
+    else:
+        parser.print_help()
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

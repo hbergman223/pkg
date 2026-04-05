@@ -1,0 +1,2 @@
+7.4.0 - Initially packaged
+7.4.1 - Patched /usr/bin/neofetch to include pkg packages in its packages section - Hunter Bergman <hunterbergman125@gmail.com>
