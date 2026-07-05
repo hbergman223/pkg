@@ -44,7 +44,6 @@ hello
 
 | Package        | Version | License          | Description                                 |
 | -------------- | ------- | ---------------- | ------------------------------------------- |
-| bacsh          | 0.1.0   | MIT              | Minimal Bourne-style shell                  |
 | bones          | 1.0     | MIT              | Ranger-like file explorer with ncurses      |
 | gnu-hello      | 2.12    | GPL-3.0+ | GNU Hello program                           |
 | libsyscalls    | 1.0.0   | MIT              | System call library                         |
