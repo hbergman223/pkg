@@ -150,7 +150,7 @@ data/
 
 ```bash
 # Install gnu-hello
-pkg -i pkg-dirs/gnu-hello.pkg
+pkg -i pkgs/gnu-hello.pkg
 
 # Run hello
 hello
