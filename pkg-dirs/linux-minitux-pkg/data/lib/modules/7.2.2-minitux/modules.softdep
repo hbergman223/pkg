@@ -1,0 +1,4 @@
+# Soft dependencies extracted from modules themselves.
+softdep xts pre: ecb
+softdep intel_lpss pre: platform:idma64
+softdep r8169 pre: realtek

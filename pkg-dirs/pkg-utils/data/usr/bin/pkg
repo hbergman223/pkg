@@ -7,14 +7,24 @@ import argparse
 import tarfile
 import json
 import os
+import re
+import stat
 import sys
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
 PKG_DB = Path("/var/lib/pkg/installed")  # Database of installed packages
 PKG_ROOT = Path("/")  # Root for installation
+
+
+class PackageSecurityError(Exception):
+    """Raised when a package's data directory contains something (typically
+    a symlink) that would let installation write outside the intended
+    destination tree."""
+    pass
 
 class PackageManager:
     def __init__(self, db_path: Path = PKG_DB, root: Path = PKG_ROOT):
@@ -51,6 +61,35 @@ class PackageManager:
         print(f"Package created successfully: {output_file}")
         return True
     
+    @staticmethod
+    def _extract_with_manual_safety_checks(tar: tarfile.TarFile, output_dir: Path):
+        """Manual equivalent of tarfile's built-in 'data' filter, for
+        Python versions before 3.12 where tarfile.data_filter doesn't
+        exist. Without this, extractall() on older Python has no
+        protection against a member path or symlink that escapes
+        output_dir (path traversal via e.g. '../../etc/cron.d/x', or an
+        absolute/relative symlink pointing outside the tree).
+        """
+        real_output_dir = os.path.realpath(output_dir)
+        for member in tar.getmembers():
+            member_path = os.path.realpath(os.path.join(str(output_dir), member.name))
+            if not (member_path == real_output_dir or member_path.startswith(real_output_dir + os.sep)):
+                raise PackageSecurityError(
+                    f"tarball member '{member.name}' would extract outside the destination directory"
+                )
+            if member.issym() or member.islnk():
+                link_target = member.linkname
+                if os.path.isabs(link_target):
+                    raise PackageSecurityError(
+                        f"tarball member '{member.name}' is a link to an absolute path ({link_target})"
+                    )
+                resolved_target = os.path.realpath(os.path.join(os.path.dirname(member_path), link_target))
+                if not (resolved_target == real_output_dir or resolved_target.startswith(real_output_dir + os.sep)):
+                    raise PackageSecurityError(
+                        f"tarball member '{member.name}' links outside the destination directory"
+                    )
+        tar.extractall(output_dir)
+
     def extract_package(self, package_file: Path, output_dir: Path):
         """Extract a .pkg file to a directory"""
         if not package_file.exists():
@@ -67,9 +106,19 @@ class PackageManager:
                 if hasattr(tarfile, 'data_filter'):
                     tar.extractall(output_dir, filter='data')
                 else:
-                    tar.extractall(output_dir)
+                    self._extract_with_manual_safety_checks(tar, output_dir)
         except tarfile.ReadError as e:
             print(f"Error: Could not read package file: {e}")
+            return False
+        except getattr(tarfile, 'FilterError', ()) as e:
+            # Covers AbsoluteLinkError / LinkOutsideDestinationError / etc:
+            # the tarball tried to write outside output_dir via an absolute
+            # or escaping symlink/path. Treat exactly like any other
+            # malformed/malicious package.
+            print(f"Error: Refusing to extract package: {e}")
+            return False
+        except PackageSecurityError as e:
+            print(f"Error: Refusing to extract package: {e}")
             return False
         
         print(f"Package extracted to {output_dir}")
@@ -160,117 +209,208 @@ class PackageManager:
         return True
     
     def compare_versions(self, v1: str, op: str, v2: str) -> bool:
-        """Compare version strings (simplified implementation)"""
-        # Convert versions to tuples of integers for comparison
+        """Compare version strings.
+
+        Versions are compared as tuples of integers. Only the leading
+        run of dot-separated numeric components is used, so suffixes
+        like '-amd64' or '+deb1' (e.g. '5.4.8-amd64') are stripped
+        rather than causing the whole component to be silently dropped
+        (the old '.isdigit()' filter would turn '5.4.8-amd64' into
+        (5, 4), quietly mangling the comparison).
+        """
         def parse_version(v):
-            return tuple(int(x) for x in v.split('.') if x.isdigit())
-        
+            match = re.match(r'^\s*([0-9]+(?:\.[0-9]+)*)', v)
+            if not match:
+                raise ValueError(f"cannot parse version string: {v!r}")
+            return tuple(int(x) for x in match.group(1).split('.'))
+
         try:
             ver1 = parse_version(v1)
             ver2 = parse_version(v2)
-            
-            if op == '>=':
-                return ver1 >= ver2
-            elif op == '>':
-                return ver1 > ver2
-            elif op == '<=':
-                return ver1 <= ver2
-            elif op == '<':
-                return ver1 < ver2
-            elif op == '==':
-                return ver1 == ver2
-            else:
-                return True
-        except:
-            return True  # If parsing fails, don't block installation
+        except ValueError as e:
+            # Fail closed: an unparseable version should not silently
+            # satisfy a dependency requirement.
+            print(f"Warning: {e}; treating dependency as unsatisfied")
+            return False
+
+        if op == '>=':
+            return ver1 >= ver2
+        elif op == '>':
+            return ver1 > ver2
+        elif op == '<=':
+            return ver1 <= ver2
+        elif op == '<':
+            return ver1 < ver2
+        elif op == '==':
+            return ver1 == ver2
+        else:
+            print(f"Warning: unknown version comparison operator '{op}'; treating dependency as unsatisfied")
+            return False
     
+    def _safe_iter_data_files(self, data_dir: Path):
+        """Yield (item, rel_path, is_symlink) for every regular file and
+        symlink under data_dir, refusing anything that would resolve
+        outside data_dir.
+
+        A malicious package could otherwise ship a symlink (or reach a
+        file only through a symlinked parent directory) pointing outside
+        the package's own data/ tree, and have install_package() write
+        or read through it. Raises PackageSecurityError if that's
+        detected; nothing is installed once that happens.
+        """
+        real_data_dir = os.path.realpath(data_dir)
+        for item in sorted(data_dir.rglob("*")):
+            if item.is_symlink():
+                rel_path = item.relative_to(data_dir)
+                target = os.path.realpath(item)
+                if target != real_data_dir and not target.startswith(real_data_dir + os.sep):
+                    raise PackageSecurityError(
+                        f"symlink '{rel_path}' resolves outside the package's data "
+                        f"directory (target: {os.readlink(item)})"
+                    )
+                yield item, rel_path, True
+            elif item.is_file():
+                rel_path = item.relative_to(data_dir)
+                real_item = os.path.realpath(item)
+                if not real_item.startswith(real_data_dir + os.sep):
+                    raise PackageSecurityError(
+                        f"'{rel_path}' resolves outside the package's data directory "
+                        f"(likely reached through a symlinked directory)"
+                    )
+                yield item, rel_path, False
+
+    @staticmethod
+    def _strip_setuid_setgid(path: Path):
+        """Remove setuid/setgid bits from an installed file. A package
+        should not be able to silently plant a setuid-root binary just by
+        having those bits set in its tarball."""
+        try:
+            st = path.stat()
+            stripped_mode = st.st_mode & ~(stat.S_ISUID | stat.S_ISGID)
+            if stripped_mode != st.st_mode:
+                print(f"Warning: stripped setuid/setgid bit from {path}")
+                os.chmod(path, stripped_mode)
+        except OSError as e:
+            print(f"Warning: could not inspect/strip permissions on {path}: {e}")
+
+    @staticmethod
+    def _rollback_installed_paths(paths):
+        """Best-effort removal of files/symlinks already written during a
+        install that failed partway through, so a failed install doesn't
+        leave an untracked partial package on disk."""
+        if not paths:
+            return
+        print("Rolling back partially installed files...")
+        for p in reversed(paths):
+            try:
+                if p.is_symlink() or p.exists():
+                    p.unlink()
+                    print(f"  Removed: {p}")
+            except OSError as e:
+                print(f"  Warning: could not remove {p} during rollback: {e}")
+
     def install_package(self, package_file: Path, force: bool = False):
         """Install a .pkg file"""
         if not package_file.exists():
             print(f"Error: Package file {package_file} does not exist")
             return False
         
-        # Extract to temporary directory
-        temp_dir = Path("/tmp/pkg_install")
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-        
-        print(f"Installing package {package_file}...")
-        if not self.extract_package(package_file, temp_dir):
-            return False
-        
-        # Read metadata
-        metadata = self.read_metadata(temp_dir)
-        pkg_name = metadata.get('name')
-        
-        if not pkg_name:
-            print("Error: Package metadata missing 'name' field")
-            shutil.rmtree(temp_dir)
-            return False
-        
-        pkg_version = metadata.get('version', 'unknown')
-        
-        print(f"Package: {pkg_name}")
-        print(f"Version: {pkg_version}")
-        print(f"Author: {metadata.get('author', 'unknown')}")
-        
-        # Check dependencies
-        depends = metadata.get('depends', '')
-        if depends:
-            print(f"Dependencies: {depends}")
-            if not self.check_dependencies(depends):
-                shutil.rmtree(temp_dir)
+        # Extract to a fresh, unpredictable temp directory rather than a
+        # fixed path - avoids symlink-planting races and lets concurrent
+        # `pkg -i` invocations coexist.
+        temp_dir = Path(tempfile.mkdtemp(prefix="pkg_install_"))
+        installed_paths = []
+
+        try:
+            print(f"Installing package {package_file}...")
+            if not self.extract_package(package_file, temp_dir):
                 return False
-        
-        # Check if already installed
-        pkg_db_entry = self.db_path / pkg_name
-        if pkg_db_entry.exists() and not force:
-            installed_version = (pkg_db_entry / "metadata" / "version").read_text().strip()
-            print(f"Package {pkg_name} version {installed_version} is already installed")
-            print("Use --force to reinstall")
-            shutil.rmtree(temp_dir)
-            return False
-        
-        # Run preinst script
-        preinst = temp_dir / "metadata" / "preinst"
-        if not self.run_script(preinst, "install", pkg_name):
-            print("Error: preinst script failed")
-            shutil.rmtree(temp_dir)
-            return False
-        
-        # Copy data files to root
-        data_dir = temp_dir / "data"
-        if data_dir.exists():
-            for item in data_dir.rglob("*"):
-                if item.is_file():
-                    rel_path = item.relative_to(data_dir)
+            
+            # Read metadata
+            metadata = self.read_metadata(temp_dir)
+            pkg_name = metadata.get('name')
+            
+            if not pkg_name:
+                print("Error: Package metadata missing 'name' field")
+                return False
+            
+            pkg_version = metadata.get('version', 'unknown')
+            
+            print(f"Package: {pkg_name}")
+            print(f"Version: {pkg_version}")
+            print(f"Author: {metadata.get('author', 'unknown')}")
+            
+            # Check dependencies
+            depends = metadata.get('depends', '')
+            if depends:
+                print(f"Dependencies: {depends}")
+                if not self.check_dependencies(depends):
+                    return False
+            
+            # Check if already installed
+            pkg_db_entry = self.db_path / pkg_name
+            if pkg_db_entry.exists() and not force:
+                installed_version = (pkg_db_entry / "metadata" / "version").read_text().strip()
+                print(f"Package {pkg_name} version {installed_version} is already installed")
+                print("Use --force to reinstall")
+                return False
+            
+            # Run preinst script
+            preinst = temp_dir / "metadata" / "preinst"
+            if not self.run_script(preinst, "install", pkg_name):
+                print("Error: preinst script failed")
+                return False
+            
+            # Copy data files to root
+            data_dir = temp_dir / "data"
+            data_entries = []
+            if data_dir.exists():
+                try:
+                    data_entries = list(self._safe_iter_data_files(data_dir))
+                except PackageSecurityError as e:
+                    print(f"Error: refusing to install package: {e}")
+                    return False
+
+                for item, rel_path, is_symlink in data_entries:
                     dest = self.root / rel_path
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    print(f"Installing: {rel_path}")
-                    shutil.copy2(item, dest)
-        
-        # Save metadata to package database
-        pkg_db_entry.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(temp_dir / "metadata", pkg_db_entry / "metadata", dirs_exist_ok=True)
-        
-        # Save file list
-        file_list = pkg_db_entry / "files.list"
-        with open(file_list, "w") as f:
-            for item in data_dir.rglob("*"):
-                if item.is_file():
-                    rel_path = item.relative_to(data_dir)
+                    try:
+                        if is_symlink:
+                            link_target = os.readlink(item)
+                            if dest.is_symlink() or dest.exists():
+                                dest.unlink()
+                            os.symlink(link_target, dest)
+                            print(f"Installing: {rel_path} -> {link_target} (symlink)")
+                        else:
+                            print(f"Installing: {rel_path}")
+                            shutil.copy2(item, dest)
+                            self._strip_setuid_setgid(dest)
+                        installed_paths.append(dest)
+                    except OSError as e:
+                        print(f"Error: failed to install '{rel_path}': {e}")
+                        self._rollback_installed_paths(installed_paths)
+                        return False
+            
+            # Save metadata to package database
+            pkg_db_entry.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(temp_dir / "metadata", pkg_db_entry / "metadata", dirs_exist_ok=True)
+            
+            # Save file list (covers both regular files and symlinks, so
+            # remove_package() can clean up either)
+            file_list = pkg_db_entry / "files.list"
+            with open(file_list, "w") as f:
+                for _, rel_path, _is_symlink in data_entries:
                     f.write(f"{rel_path}\n")
-        
-        # Run postinst script
-        postinst = pkg_db_entry / "metadata" / "postinst"
-        if not self.run_script(postinst, "configure", pkg_name):
-            print("Warning: postinst script failed (package installed but may not be configured correctly)")
-        
-        # Cleanup
-        shutil.rmtree(temp_dir)
-        
-        print(f"\nPackage {pkg_name} installed successfully")
-        return True
+            
+            # Run postinst script
+            postinst = pkg_db_entry / "metadata" / "postinst"
+            if not self.run_script(postinst, "configure", pkg_name):
+                print("Warning: postinst script failed (package installed but may not be configured correctly)")
+            
+            print(f"\nPackage {pkg_name} installed successfully")
+            return True
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
     
     def remove_package(self, package_name: str):
         """Remove an installed package"""
@@ -348,7 +488,7 @@ class PackageManager:
         print(f"Package: {pkg_name}")
         print(f"Version: {metadata.get('version', 'unknown')}")
         print(f"Author: {metadata.get('author', 'unknown')}")
-        
+       
         if 'depends' in metadata:
             print(f"Dependencies: {metadata['depends']}")
         

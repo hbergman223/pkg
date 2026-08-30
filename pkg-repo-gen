@@ -56,14 +56,23 @@ def calculate_checksums(file_path: Path) -> Dict[str, str]:
     return checksums
 
 def generate_index(repo_dir: Path, output_file: Path):
-    """Generate repository index from .pkg files"""
-    
+    """Generate a repository index from .pkg files.
+
+    Index format (v2): packages[name]['versions'][version_str] = entry.
+    Older (v1) index consumers expected packages[name] to *be* a single
+    entry - that flattened the moment two .pkg files shared a name but
+    had different versions, silently keeping only whichever file the
+    directory listing happened to process last. v2 keeps every version,
+    so a client (like pkg-repo) can pick whichever one actually satisfies
+    a dependency constraint instead of being handed just one option.
+    """
+
     if not repo_dir.exists():
         print(f"Error: Repository directory {repo_dir} does not exist")
         return False
     
     index = {
-        'version': 1,
+        'version': 2,
         'packages': {}
     }
     
@@ -75,6 +84,7 @@ def generate_index(repo_dir: Path, output_file: Path):
     
     print(f"Processing {len(pkg_files)} package(s)...")
     
+    total_versions = 0
     for pkg_file in pkg_files:
         print(f"  Processing {pkg_file.name}...")
         
@@ -89,15 +99,17 @@ def generate_index(repo_dir: Path, output_file: Path):
             print(f"    Warning: No package name found, skipping")
             continue
         
+        version = metadata.get('version', 'unknown')
+
         # Calculate checksums
         checksums = calculate_checksums(pkg_file)
         
         # Get file size
         size = pkg_file.stat().st_size
         
-        # Build package entry
+        # Build package entry (no 'version' key inside - the version is
+        # the dict key it's stored under)
         pkg_entry = {
-            'version': metadata.get('version', 'unknown'),
             'filename': pkg_file.name,
             'size': size,
             'md5sum': checksums['md5'],
@@ -114,15 +126,26 @@ def generate_index(repo_dir: Path, output_file: Path):
         if 'description' in metadata:
             pkg_entry['description'] = metadata['description']
         
-        index['packages'][pkg_name] = pkg_entry
-        print(f"    Added {pkg_name} {pkg_entry['version']}")
+        pkg_entry_group = index['packages'].setdefault(pkg_name, {'versions': {}})
+        existing = pkg_entry_group['versions'].get(version)
+        if existing is not None and existing['filename'] != pkg_file.name:
+            print(f"    Warning: {pkg_name} {version} already provided by "
+                  f"{existing['filename']}; overwriting with {pkg_file.name}")
+        pkg_entry_group['versions'][version] = pkg_entry
+        total_versions += 1
+        print(f"    Added {pkg_name} {version}")
     
     # Write index
     with open(output_file, 'w') as f:
         json.dump(index, f, indent=2)
     
     print(f"\nRepository index generated: {output_file}")
-    print(f"Total packages: {len(index['packages'])}")
+    print(f"Total packages: {len(index['packages'])} ({total_versions} version(s) total)")
+    multi = {name: entry for name, entry in index['packages'].items() if len(entry['versions']) > 1}
+    if multi:
+        print("Packages with multiple versions available:")
+        for name, entry in multi.items():
+            print(f"  {name}: {', '.join(sorted(entry['versions'].keys()))}")
     
     return True
 

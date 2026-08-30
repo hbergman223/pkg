@@ -152,7 +152,7 @@ echo "{package_name} {clean_version} installed successfully"
     if pkg_output:
         print(f"Building {pkg_output}...")
         result = subprocess.run(
-            ['./pkg', '-b', str(pkg_dir), '-o', str(pkg_output)],
+            ['pkg', '-b', str(pkg_dir), '-o', str(pkg_output)],
             capture_output=True,
             text=True
         )
@@ -205,7 +205,7 @@ def main():
     success = convert_deb_to_pkg(args.deb_file, args.dir, pkg_output)
     
     if success and pkg_output:
-        print(f"\nTo install: sudo ./pkg -i {pkg_output}")
+        print(f"\nTo install: sudo pkg -i {pkg_output}")
     
     return 0 if success else 1
 

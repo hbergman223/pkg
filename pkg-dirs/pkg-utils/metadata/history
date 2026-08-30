@@ -1,5 +1,7 @@
 1.0 - Released
-1.0.1 - Updated depends and history - Hunter Bergman <hunterbergman125@gmail.com>
-1.0.2 - Rolled back update 1.0.1 and fixed postinst script - Hunter Bergman <hunterbergman125@gmail.com>
-1.1.0 - Added repository support and new commands: pkg-get and pkg-repo-gen - Hunter Bergman <hunterbergman125@gmail.com>
-1.1.1 - Fixed pkg-get to correctly display "pkg-get" instead of "pkg-repo" and updated postinst script - Hunter Bergman <hunterbergman125@gmail.com>
+1.0.1 - Updated depends and history - Hunter Bergman <hunterbergman223@gmail.com>
+1.0.2 - Rolled back update 1.0.1 and fixed postinst script - Hunter Bergman <hunterbergman223@gmail.com>
+1.1.0 - Added repository support and new commands: pkg-get and pkg-repo-gen - Hunter Bergman <hunterbergman223@gmail.com>
+1.1.1 - Fixed pkg-get to correctly display "pkg-get" instead of "pkg-repo" and updated postinst script - Hunter Bergman <hunterbergman223@gmail.com>
+1.1.2 - Added more security measures to pkg and pkg-repo-gen to ensure no somewhat competent hacker compromises packages - Hunter Bergman <hunterbergman223@gmail.com>
+1.1.3 - Renaming: pkg-get is now pkg-repo, and naming should be consistent for all programs. - Hunter Bergman <hunterbergman223@gmail.com>

@@ -1,0 +1,8 @@
+# Device nodes to trigger on-demand module loading.
+autofs4 autofs c10:235
+loop loop-control c10:237
+uinput uinput c10:223
+dm_mod mapper/control c10:236
+snd_timer snd/timer c116:33
+snd_seq snd/seq c116:1
+rfkill rfkill c10:242
