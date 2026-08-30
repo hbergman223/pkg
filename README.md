@@ -1,7 +1,7 @@
 # pkg – A dpkg-Inspired Package Manager [![License: GPL-3.0+](https://img.shields.io/badge/license-GPL--3.0+-blue.svg)](LICENSE)
 
 ### **Author:** Hunter Bergman [hunterbergman125@gmail.com](mailto:hunterbergman125@gmail.com)
-
+# OUTDATED!
 `pkg` is a lightweight, Python-based package manager inspired by Debian’s `dpkg`. It allows users to create, install, extract, and manage `.pkg` packages on Linux systems. Its companion tools (`pkg-get`, `pkg-repo-gen`, `deb2pkg`) enable repository management and easy conversion from Debian `.deb` packages.
 
 ---
