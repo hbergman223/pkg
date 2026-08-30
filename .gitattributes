@@ -1,1 +1,2 @@
+. filter=lfs diff=lfs merge=lfs -text
 pkg-dirs/linux-minitux-pkg/data/boot/initrd.img-7.2.2-minitux filter=lfs diff=lfs merge=lfs -text
